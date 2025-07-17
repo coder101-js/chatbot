@@ -19,7 +19,7 @@ MAX_LENGTH = 20
 class ChatDataset(Dataset):
     def __init__(self, data_path):
         with open(data_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+            data = json.load(f) 
 
         self.pairs = [(pair['input'], pair['target']) for pair in data]
         self.token2idx = {PAD_TOKEN: 0, SOS_TOKEN: 1, EOS_TOKEN: 2, UNK_TOKEN: 3}
