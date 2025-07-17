@@ -1,80 +1,94 @@
-import torch, torch.nn as nn, torch.optim as optim
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-import os, time, signal, re, random, sys
-from datetime import datetime
+import random
+import time
+import os
+import json
 
-# ========== Dataset & Preprocessing ==========
+# Define constants
+PAD_TOKEN = "<PAD>"
+SOS_TOKEN = "<SOS>"
+EOS_TOKEN = "<EOS>"
+UNK_TOKEN = "<UNK>"
+MAX_LENGTH = 20
 
-def clean(text):
-    text = text.lower()
-    text = re.sub(r"[^a-zA-Z0-9?.!,']+", " ", text)
-    return text.strip()
-
+# Dataset class
 class ChatDataset(Dataset):
-    def __init__(self, path='data.txt'):
-        self.pairs = []
-        with open(path, 'r', encoding='utf-8') as f:
-            for line in f:
-                if ',' not in line:
-                    continue
-                q, a = line.strip().split(',', 1)
-                self.pairs.append((clean(q), clean(a)))
+    def __init__(self, data_path):
+        with open(data_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
 
-        self.token2idx = {'<pad>': 0, '<sos>': 1, '<eos>': 2, '<unk>': 3}
-        self.idx2token = ['<pad>', '<sos>', '<eos>', '<unk>']
-        self.build_vocab()
+        self.pairs = [(pair['input'], pair['target']) for pair in data]
+        self.token2idx = {PAD_TOKEN: 0, SOS_TOKEN: 1, EOS_TOKEN: 2, UNK_TOKEN: 3}
+        self.idx2token = [PAD_TOKEN, SOS_TOKEN, EOS_TOKEN, UNK_TOKEN]
 
-    def build_vocab(self):
-        for q, a in self.pairs:
-            for word in (q + " " + a).split():
-                if word not in self.token2idx:
-                    self.idx2token.append(word)
-                    self.token2idx[word] = len(self.idx2token) - 1
+        for pair in self.pairs:
+            for sentence in pair:
+                for word in sentence.split():
+                    if word not in self.token2idx:
+                        self.token2idx[word] = len(self.idx2token)
+                        self.idx2token.append(word)
+
+        self.data = [
+            (self.encode(pair[0]), self.encode(pair[1]))
+            for pair in self.pairs
+        ]
 
     def encode(self, sentence):
-        return [self.token2idx.get(w, 3) for w in sentence.split()]
+        return [self.token2idx.get(word, self.token2idx[UNK_TOKEN]) for word in sentence.split()] + [self.token2idx[EOS_TOKEN]]
 
     def __len__(self):
-        return len(self.pairs)
+        return len(self.data)
 
     def __getitem__(self, idx):
-        q, a = self.pairs[idx]
-        q_ids = self.encode(q)
-        a_ids = [1] + self.encode(a) + [2]  # <sos> ... <eos>
-        return torch.tensor(q_ids), torch.tensor(a_ids)
+        return self.data[idx]
 
-def collate_fn(batch):
-    qs, as_ = zip(*batch)
-    qs = nn.utils.rnn.pad_sequence(qs, batch_first=True)
-    as_ = nn.utils.rnn.pad_sequence(as_, batch_first=True)
-    return qs, as_
+    def get_vocab(self):
+        return {
+            "word2index": self.token2idx,
+            "index2word": {i: w for i, w in enumerate(self.idx2token)}
+        }
 
-# ========== Models ==========
-
+# Encoder RNN
 class Encoder(nn.Module):
-    def __init__(self, vocab_size, embed_size, hidden_size, num_layers=2):
-        super().__init__()
-        self.embed = nn.Embedding(vocab_size, embed_size)
-        self.gru = nn.GRU(embed_size, hidden_size, num_layers=num_layers, batch_first=True)
+    def __init__(self, vocab_size, embed_size, hidden_size):
+        super(Encoder, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_size)
+        self.rnn = nn.GRU(embed_size, hidden_size, batch_first=True)
 
     def forward(self, x):
-        x = self.embed(x)
-        outputs, hidden = self.gru(x)
-        return hidden
+        embedded = self.embedding(x)
+        outputs, hidden = self.rnn(embedded)
+        return outputs, hidden
 
+# Decoder RNN
 class Decoder(nn.Module):
-    def __init__(self, vocab_size, embed_size, hidden_size, num_layers=2):
-        super().__init__()
-        self.embed = nn.Embedding(vocab_size, embed_size)
-        self.gru = nn.GRU(embed_size, hidden_size, num_layers=num_layers, batch_first=True)
+    def __init__(self, vocab_size, embed_size, hidden_size):
+        super(Decoder, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_size)
+        self.rnn = nn.GRU(embed_size, hidden_size, batch_first=True)
         self.fc = nn.Linear(hidden_size, vocab_size)
 
     def forward(self, x, hidden):
-        x = self.embed(x.unsqueeze(1))
-        output, hidden = self.gru(x, hidden)
-        return self.fc(output.squeeze(1)), hidden
+        embedded = self.embedding(x).unsqueeze(1)
+        output, hidden = self.rnn(embedded, hidden)
+        output = self.fc(output.squeeze(1))
+        return output, hidden
 
-# ========== Checkpoint Utils ==========
+# Utility functions
+
+def pad_sequences(sequences, pad_value=0):
+    max_len = max(len(seq) for seq in sequences)
+    return [seq + [pad_value] * (max_len - len(seq)) for seq in sequences]
+
+def collate_fn(batch):
+    inputs, targets = zip(*batch)
+    inputs = pad_sequences(inputs)
+    targets = pad_sequences(targets)
+    return torch.tensor(inputs), torch.tensor(targets)
 
 def save_checkpoint(path, encoder, decoder, enc_opt, dec_opt, best_loss, vocab):
     torch.save({
@@ -86,68 +100,58 @@ def save_checkpoint(path, encoder, decoder, enc_opt, dec_opt, best_loss, vocab):
         'vocab': vocab
     }, path)
 
-# ========== Global for SIGINT ==========
-
-should_exit = False
-
-def signal_handler(sig, frame):
-    global should_exit
-    print("\n[⚠️] Ctrl+C detected! Will save and exit after current batch.")
-    should_exit = True
-signal.signal(signal.SIGINT, signal_handler)
-
-# ========== Main Training Loop ==========
+# Training loop
 
 def train():
-    print("[🚀] Loading dataset...")
-    dataset = ChatDataset('data.txt')
-    loader = DataLoader(dataset, batch_size=64, shuffle=True, collate_fn=collate_fn)
+    dataset = ChatDataset("data.json")
+    dataloader = DataLoader(dataset, batch_size=32, shuffle=True, collate_fn=collate_fn)
 
     vocab_size = len(dataset.token2idx)
-    encoder = Encoder(vocab_size, 256, 512)
-    decoder = Decoder(vocab_size, 256, 512)
-    enc_opt = optim.Adam(encoder.parameters(), lr=0.0005)
-    dec_opt = optim.Adam(decoder.parameters(), lr=0.0005)
-    loss_fn = nn.CrossEntropyLoss(ignore_index=0)
+    embed_size = 64
+    hidden_size = 128
+
+    encoder = Encoder(vocab_size, embed_size, hidden_size)
+    decoder = Decoder(vocab_size, embed_size, hidden_size)
+
+    enc_opt = optim.Adam(encoder.parameters(), lr=0.001)
+    dec_opt = optim.Adam(decoder.parameters(), lr=0.001)
 
     best_loss = float('inf')
-    start_time = time.time()
-    max_duration = 12 * 24 * 3600  # 12 days in seconds
 
-    epoch = 0
-    while time.time() - start_time < max_duration:
-        for i, (src, tgt) in enumerate(loader):
-            enc_hidden = encoder(src)
-            dec_input = tgt[:, 0]
-            loss = 0
-
-            for t in range(1, tgt.size(1)):
-                output, enc_hidden = decoder(dec_input, enc_hidden)
-                loss += loss_fn(output, tgt[:, t])
-                dec_input = tgt[:, t]
-
+    for epoch in range(10):
+        total_loss = 0
+        for inputs, targets in dataloader:
             enc_opt.zero_grad()
             dec_opt.zero_grad()
+
+            _, hidden = encoder(inputs)
+            dec_input = torch.full((inputs.size(0),), dataset.token2idx[SOS_TOKEN], dtype=torch.long)
+            loss = 0
+
+            for t in range(targets.size(1)):
+                output, hidden = decoder(dec_input, hidden)
+                loss += F.cross_entropy(output, targets[:, t])
+                dec_input = targets[:, t]
+
             loss.backward()
             enc_opt.step()
             dec_opt.step()
 
-            avg_loss = loss.item() / tgt.size(1)
-            print(f"[{epoch}:{i}] Loss: {avg_loss:.4f}")
+            total_loss += loss.item() / targets.size(1)
 
-            if avg_loss < best_loss:
-                best_loss = avg_loss
-                save_checkpoint("best_model.pth", encoder, decoder, enc_opt, dec_opt, best_loss, dataset.token2idx)
-                print(f"[🔥] Best model saved! Loss: {best_loss:.4f}")
+        avg_loss = total_loss / len(dataloader)
+        print(f"Epoch {epoch+1}, Loss: {avg_loss:.4f}")
 
-            if i % 20 == 0:
-                save_checkpoint("checkpoint.pth", encoder, decoder, enc_opt, dec_opt, best_loss, dataset.token2idx)
+        vocab = dataset.get_vocab()
 
-            if should_exit:
-                save_checkpoint("checkpoint_exit.pth", encoder, decoder, enc_opt, dec_opt, best_loss, dataset.token2idx)
-                print("[✅] Exit checkpoint saved. Bye!")
-                sys.exit(0)
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            save_checkpoint("best_model.pth", encoder, decoder, enc_opt, dec_opt, best_loss, vocab)
+            print(f"[🔥] Best model saved! Loss: {best_loss:.4f}")
 
-        epoch += 1
+        save_checkpoint("checkpoint.pth", encoder, decoder, enc_opt, dec_opt, best_loss, vocab)
 
-train()
+    save_checkpoint("checkpoint_exit.pth", encoder, decoder, enc_opt, dec_opt, best_loss, vocab)
+
+if __name__ == '__main__':
+    train()
