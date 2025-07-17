@@ -15,7 +15,10 @@ class ChatDataset(Dataset):
         self.pairs = []
         with open(path, 'r', encoding='utf-8') as f:
             for line in f:
-                q, a = line.strip().split(',')
+                if ',' not in line:
+                    continue
+                q, a = line.strip().split(',', 1)
+
                 self.pairs.append((clean(q), clean(a)))
 
         self.token2idx = {'<pad>': 0, '<sos>': 1, '<eos>': 2}
