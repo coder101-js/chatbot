@@ -86,14 +86,6 @@ def save_checkpoint(path, encoder, decoder, enc_opt, dec_opt, best_loss, vocab):
         'vocab': vocab
     }, path)
 
-def load_checkpoint(path, encoder, decoder, enc_opt, dec_opt):
-    checkpoint = torch.load(path)
-    encoder.load_state_dict(checkpoint['encoder'])
-    decoder.load_state_dict(checkpoint['decoder'])
-    enc_opt.load_state_dict(checkpoint['enc_opt'])
-    dec_opt.load_state_dict(checkpoint['dec_opt'])
-    return checkpoint['best_loss'], checkpoint['vocab']
-
 # ========== Global for SIGINT ==========
 
 should_exit = False
@@ -121,11 +113,6 @@ def train():
     best_loss = float('inf')
     start_time = time.time()
     max_duration = 12 * 24 * 3600  # 12 days in seconds
-
-    if os.path.exists("checkpoint.pth"):
-        print("[💾] Resuming from checkpoint...")
-        best_loss, vocab = load_checkpoint("checkpoint.pth", encoder, decoder, enc_opt, dec_opt)
-        dataset.token2idx = vocab
 
     epoch = 0
     while time.time() - start_time < max_duration:
