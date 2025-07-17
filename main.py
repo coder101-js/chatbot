@@ -18,11 +18,10 @@ class ChatDataset(Dataset):
                 if ',' not in line:
                     continue
                 q, a = line.strip().split(',', 1)
-
                 self.pairs.append((clean(q), clean(a)))
 
-        self.token2idx = {'<pad>': 0, '<sos>': 1, '<eos>': 2}
-        self.idx2token = ['<pad>', '<sos>', '<eos>']
+        self.token2idx = {'<pad>': 0, '<sos>': 1, '<eos>': 2, '<unk>': 3}
+        self.idx2token = ['<pad>', '<sos>', '<eos>', '<unk>']
         self.build_vocab()
 
     def build_vocab(self):
@@ -33,7 +32,7 @@ class ChatDataset(Dataset):
                     self.token2idx[word] = len(self.idx2token) - 1
 
     def encode(self, sentence):
-        return [self.token2idx[w] for w in sentence.split() if w in self.token2idx]
+        return [self.token2idx.get(w, 3) for w in sentence.split()]
 
     def __len__(self):
         return len(self.pairs)
@@ -53,10 +52,10 @@ def collate_fn(batch):
 # ========== Models ==========
 
 class Encoder(nn.Module):
-    def __init__(self, vocab_size, embed_size, hidden_size):
+    def __init__(self, vocab_size, embed_size, hidden_size, num_layers=2):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, embed_size)
-        self.gru = nn.GRU(embed_size, hidden_size, batch_first=True)
+        self.gru = nn.GRU(embed_size, hidden_size, num_layers=num_layers, batch_first=True)
 
     def forward(self, x):
         x = self.embed(x)
@@ -64,10 +63,10 @@ class Encoder(nn.Module):
         return hidden
 
 class Decoder(nn.Module):
-    def __init__(self, vocab_size, embed_size, hidden_size):
+    def __init__(self, vocab_size, embed_size, hidden_size, num_layers=2):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, embed_size)
-        self.gru = nn.GRU(embed_size, hidden_size, batch_first=True)
+        self.gru = nn.GRU(embed_size, hidden_size, num_layers=num_layers, batch_first=True)
         self.fc = nn.Linear(hidden_size, vocab_size)
 
     def forward(self, x, hidden):
@@ -98,6 +97,7 @@ def load_checkpoint(path, encoder, decoder, enc_opt, dec_opt):
 # ========== Global for SIGINT ==========
 
 should_exit = False
+
 def signal_handler(sig, frame):
     global should_exit
     print("\n[⚠️] Ctrl+C detected! Will save and exit after current batch.")
@@ -109,27 +109,26 @@ signal.signal(signal.SIGINT, signal_handler)
 def train():
     print("[🚀] Loading dataset...")
     dataset = ChatDataset('data.txt')
-    loader = DataLoader(dataset, batch_size=32, shuffle=True, collate_fn=collate_fn)
+    loader = DataLoader(dataset, batch_size=64, shuffle=True, collate_fn=collate_fn)
 
     vocab_size = len(dataset.token2idx)
-    encoder = Encoder(vocab_size, 128, 256)
-    decoder = Decoder(vocab_size, 128, 256)
-    enc_opt = optim.Adam(encoder.parameters(), lr=0.001)
-    dec_opt = optim.Adam(decoder.parameters(), lr=0.001)
+    encoder = Encoder(vocab_size, 256, 512)
+    decoder = Decoder(vocab_size, 256, 512)
+    enc_opt = optim.Adam(encoder.parameters(), lr=0.0005)
+    dec_opt = optim.Adam(decoder.parameters(), lr=0.0005)
     loss_fn = nn.CrossEntropyLoss(ignore_index=0)
 
     best_loss = float('inf')
     start_time = time.time()
-    pause_duration = random.randint(60, 120)  # 1–2 min rest
-    last_pause = time.time()
+    max_duration = 12 * 24 * 3600  # 12 days in seconds
 
-    # Resume if checkpoint exists
     if os.path.exists("checkpoint.pth"):
         print("[💾] Resuming from checkpoint...")
         best_loss, vocab = load_checkpoint("checkpoint.pth", encoder, decoder, enc_opt, dec_opt)
         dataset.token2idx = vocab
 
-    for epoch in range(1000):  # you control how long this runs
+    epoch = 0
+    while time.time() - start_time < max_duration:
         for i, (src, tgt) in enumerate(loader):
             enc_hidden = encoder(src)
             dec_input = tgt[:, 0]
@@ -138,7 +137,7 @@ def train():
             for t in range(1, tgt.size(1)):
                 output, enc_hidden = decoder(dec_input, enc_hidden)
                 loss += loss_fn(output, tgt[:, t])
-                dec_input = tgt[:, t]  # teacher forcing
+                dec_input = tgt[:, t]
 
             enc_opt.zero_grad()
             dec_opt.zero_grad()
@@ -149,27 +148,19 @@ def train():
             avg_loss = loss.item() / tgt.size(1)
             print(f"[{epoch}:{i}] Loss: {avg_loss:.4f}")
 
-            # Save if best
             if avg_loss < best_loss:
                 best_loss = avg_loss
                 save_checkpoint("best_model.pth", encoder, decoder, enc_opt, dec_opt, best_loss, dataset.token2idx)
                 print(f"[🔥] Best model saved! Loss: {best_loss:.4f}")
 
-            # Regular checkpoint
             if i % 20 == 0:
                 save_checkpoint("checkpoint.pth", encoder, decoder, enc_opt, dec_opt, best_loss, dataset.token2idx)
 
-            # Graceful exit on Ctrl+C
             if should_exit:
                 save_checkpoint("checkpoint_exit.pth", encoder, decoder, enc_opt, dec_opt, best_loss, dataset.token2idx)
                 print("[✅] Exit checkpoint saved. Bye!")
                 sys.exit(0)
 
-            # Pause every 30 min
-            if time.time() - last_pause > 1800:
-                print(f"[🧘] 30 minutes done. Resting for {pause_duration} sec...")
-                time.sleep(pause_duration)
-                last_pause = time.time()
-                pause_duration = random.randint(60, 120)
+        epoch += 1
 
 train()
