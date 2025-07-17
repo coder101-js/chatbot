@@ -118,7 +118,7 @@ def train():
 
     best_loss = float('inf')
 
-    for epoch in range(10):
+    for epoch in range(1000):
         total_loss = 0
         for inputs, targets in dataloader:
             enc_opt.zero_grad()
